@@ -1,0 +1,45 @@
+paths:
+  dataset_root: "dataset"
+  parquet_path: "dataset/conceptual-captions-200k.parquet"
+  images_root: "dataset/cc_images"
+  models_dir: "models"
+  outputs_dir: "inference_results"
+
+models:
+  vit: "google/vit-base-patch16-224"
+  qformer_bert: "distilbert-base-uncased"
+  llm: "HuggingFaceTB/SmolLM-135M-Instruct"
+
+q_former_train:
+  lr: 1e-4
+  batch_size: 8
+  epochs: 10
+  tau: 0.07
+  log_every: 5
+  eval_every: 10
+  save_every: 20
+  limit_eval_batches: 20
+
+vlm_train:
+  lr_slow: 1e-4
+  lr_fast: 5e-4
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  epochs: 5
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  log_every: 20
+  save_every: 100
+  lora:
+    r: 64
+    alpha: 128
+    dropout: 0.1
+
+inference:
+  limit_eval_batches: 20
+  generation:
+    max_new_tokens: 100
+    temperature: 0.7
+    top_p: 0.9
+    repetition_penalty: 1.2

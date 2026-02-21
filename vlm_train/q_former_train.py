@@ -1,11 +1,17 @@
 import numpy as np
 from networks.q_former import QFormer
 import torch
-from transformers import DistilBertModel
+from transformers import DistilBertModel, ViTModel
 from datasets.cc_dataloader import get_dataloaders
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
+import os
+from utils.config_loader import load_config, get_config_val
+
+config = load_config()
+c = config["q_former_train"]
+paths = config["paths"]
 
 device = (
     "cuda"
@@ -14,15 +20,23 @@ device = (
 )
 print(f"Device: {device}")
 
-bert = DistilBertModel.from_pretrained('distilbert-base-uncased')
+bert = DistilBertModel.from_pretrained(config["models"]["qformer_bert"])
+vit = ViTModel.from_pretrained(config["models"]["vit"]).to(device)
+vit.eval() # ViT is kept frozen during alignment stage
+
 qformer = QFormer(bert)
 qformer.to(device)
 
 model_id = "trained_qformer"
-lr = 1e-4
-batch_size = 8
+lr = c["lr"]
+batch_size = c["batch_size"]
 
-train_loader, test_loader = get_dataloaders(batch_size=batch_size)
+train_loader, test_loader = get_dataloaders(
+    vit_model=config["models"]["vit"],
+    tokenizer=config["models"]["qformer_bert"],
+    batch_size=batch_size,
+    device=device
+)
 
 def calculate_clip_loss(v, t, tau=0.07):
     N = v.size(0)
@@ -35,33 +49,33 @@ def calculate_clip_loss(v, t, tau=0.07):
     loss = 0.5 * (loss_i2t + loss_t2i)
     return loss.mean()
 
-def run_inference(limit_batches=20):
+def run_inference(limit_batches=None):
+    if limit_batches is None:
+        limit_batches = c["limit_eval_batches"]
+        
     qformer.eval()
     losses = []
     with torch.no_grad():
-        for i, (img, txt) in enumerate(test_loader):
+        for i, (pixel_values, txt) in enumerate(test_loader):
             if i >= limit_batches:
                 break
             
-            # Ensure data is on the correct device
-            img = img.to(device)
-            if isinstance(txt, dict):
-                txt = {k: v.to(device) for k, v in txt.items()}
+            # Encoding images on GPU
+            visual_feats = vit(pixel_values).last_hidden_state
             
             img_emb, txt_emb = qformer(
-                visual_feats=img, 
+                visual_feats=visual_feats, 
                 text_input_ids=txt["input_ids"],
                 text_attention_mask=txt["attention_mask"],
                 attention_mode="uni_modal"
             )
-            loss = calculate_clip_loss(img_emb, txt_emb)
+            loss = calculate_clip_loss(img_emb, txt_emb, tau=c["tau"])
             losses.append(loss.item())
     qformer.train()
 
     if not losses:
         return float('inf')
     return np.mean(losses)
-
 
 grouped_params = qformer.get_grouped_params()
 optimizer = optim.Adam(
@@ -73,29 +87,26 @@ optimizer = optim.Adam(
 )
 
 steps = 0
-log_train_loss_every = 5
-run_inference_every = 10
-save_checkpoint_every = 20
 best_test_loss = np.inf
 
-for epoch in range(10):
+os.makedirs(paths["models_dir"], exist_ok=True)
+
+for epoch in range(c["epochs"]):
     train_losses = []
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-    for (img, txt) in pbar:
+    for (pixel_values, txt) in pbar:
         steps += 1
         
-        # Ensure data is on the correct device
-        img = img.to(device)
-        if isinstance(txt, dict):
-            txt = {k: v.to(device) for k, v in txt.items()}
+        with torch.no_grad():
+            visual_feats = vit(pixel_values).last_hidden_state
 
         img_emb, txt_emb = qformer(
-            visual_feats=img, 
+            visual_feats=visual_feats, 
             text_input_ids=txt["input_ids"],
             text_attention_mask=txt["attention_mask"],
             attention_mode="uni_modal"
         )
-        loss = calculate_clip_loss(img_emb, txt_emb)
+        loss = calculate_clip_loss(img_emb, txt_emb, tau=c["tau"])
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -103,26 +114,21 @@ for epoch in range(10):
         train_losses.append(loss.item())
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        if steps % log_train_loss_every == 0:
+        if steps % c["log_every"] == 0:
             tqdm.write(f"Epoch: {epoch+1}, Steps: {steps}, Train loss: {np.mean(train_losses):.4f}")
             train_losses = []
 
-        if steps % run_inference_every == 0:
+        if steps % c["eval_every"] == 0:
             test_loss = run_inference()
             tqdm.write(f"Steps: {steps}, Test Loss: {test_loss:.4f}")
 
             if test_loss < best_test_loss:
-                best_model_dir = f"models/{model_id}/best"
+                best_model_dir = os.path.join(paths["models_dir"], model_id, "best")
                 qformer.save_pretrained(best_model_dir)
-                tqdm.write(f"New model saved in {best_model_dir}")
+                tqdm.write(f"✓ New best model saved in {best_model_dir}")
                 best_test_loss = test_loss
 
-        if steps % save_checkpoint_every == 0:
-            tqdm.write(f"Checkpoint saved at step {steps}")
-            qformer.save_pretrained(f"models/{model_id}/latest")
-
-         
-
-     
-
-
+        if steps % c["save_every"] == 0:
+            latest_dir = os.path.join(paths["models_dir"], model_id, "latest")
+            qformer.save_pretrained(latest_dir)
+            tqdm.write(f"Checkpoint saved in {latest_dir}")

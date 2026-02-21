@@ -7,47 +7,53 @@ from tqdm import tqdm
 from networks.lm_to_vlm import LM_2_VLM
 import numpy as np
 from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
+    ViTModel,
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
 )
 from accelerate import Accelerator
+from utils.config_loader import load_config
 
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else ("mps" if torch.backends.mps.is_available() else "cpu")
-)
+config = load_config()
+c = config["vlm_train"]
+paths = config["paths"]
+
 if __name__ == "__main__":
-    # --- Initialize Accelerator ---
     accelerator = Accelerator(
-        gradient_accumulation_steps=4,
-        mixed_precision="bf16",  # Use bfloat16 mixed precision
+        gradient_accumulation_steps=c["gradient_accumulation_steps"],
+        mixed_precision=c["mixed_precision"], 
         log_with="tensorboard",
         project_dir="logs",
     )
 
     model_id = "vlm_peft"
-    model_name = "HuggingFaceTB/SmolLM-135M-Instruct"
+    model_name = config["models"]["llm"]
 
-    train_loader, test_loader = get_dataloader(batch_size=8, tokenizer_name=model_name)
+    train_loader, test_loader = get_dataloader(
+        batch_size=c["batch_size"], 
+        tokenizer_name=model_name,
+        device=accelerator.device
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     pad_token_id = tokenizer.pad_token_id
+    
+    vit = ViTModel.from_pretrained(config["models"]["vit"]).to(accelerator.device)
+    vit.eval()
+
+    qformer_path = os.path.join(paths["models_dir"], "trained_qformer", "best")
     model = LM_2_VLM(
         model_name=model_name,
-        qformer_model_path=f"models/trained_qformer/best",
+        qformer_model_path=qformer_path,
         pad_token_id=pad_token_id,
     )
 
     # --- Optimizer Setup ---
-    lr_slow = 1e-4
-    lr_fast = 5e-4
+    lr_slow = c["lr_slow"]
+    lr_fast = c["lr_fast"]
 
     qformer_params = model.qformer.get_grouped_params()
     optimizer = optim.AdamW(
@@ -64,18 +70,12 @@ if __name__ == "__main__":
     )
 
     # --- Training Configuration ---
-    epochs = 5
-    log_every = 20
-    save_every = 100
-    warmup_steps = 100
-    max_grad_norm = 1.0  # Gradient clipping threshold
-
-    # Calculate total training steps
+    epochs = c["epochs"]
     total_steps = len(train_loader) * epochs // accelerator.gradient_accumulation_steps
 
     # --- Cosine LR Scheduler ---
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        optimizer, num_warmup_steps=c["warmup_steps"], num_training_steps=total_steps
     )
 
     # --- Prepare with Accelerator ---
@@ -94,30 +94,24 @@ if __name__ == "__main__":
                 if i >= limit_batches:
                     break
 
-                img = data["image"]
+                pixel_values = data["pixel_values"]
                 prefix = data["prefix"]
                 assistant = data["assistant_prompt"]
 
-                with accelerator.autocast():
-                    output = model(img, prefix, assistant)
+                visual_feats = vit(pixel_values).last_hidden_state
 
-                # Gather losses from all processes if using distributed training
+                with accelerator.autocast():
+                    output = model(visual_feats, prefix, assistant)
+
                 loss = accelerator.gather(output.loss).mean()
                 losses.append(loss.item())
 
         model.train()
-
-        if not losses:
-            return float("inf")
-        return np.mean(losses)
+        return np.mean(losses) if losses else float("inf")
 
     model.train()
-
-    accelerator.print("Starting training...")
+    accelerator.print(f"Starting training for {epochs} epochs...")
     accelerator.print(f"Total training steps: {total_steps}")
-    accelerator.print(
-        f"Gradient accumulation steps: {accelerator.gradient_accumulation_steps}"
-    )
 
     for epoch in range(epochs):
         pbar = tqdm(
@@ -128,25 +122,26 @@ if __name__ == "__main__":
 
         for data in pbar:
             with accelerator.accumulate(model):
-                img = data["image"]
+                pixel_values = data["pixel_values"]
                 prefix = data["prefix"]
                 assistant = data["assistant_prompt"]
 
+                with torch.no_grad():
+                    visual_feats = vit(pixel_values).last_hidden_state
+
                 with accelerator.autocast():
-                    output = model(img, prefix, assistant)
+                    output = model(visual_feats, prefix, assistant)
                     loss = output.loss
 
                 accelerator.backward(loss)
 
-                # Gradient clipping
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    accelerator.clip_grad_norm_(model.parameters(), c["max_grad_norm"])
 
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            # Only log on main process
             if accelerator.is_local_main_process:
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}"
@@ -154,27 +149,27 @@ if __name__ == "__main__":
 
             step += 1
 
-            if step % log_every == 0 and accelerator.is_local_main_process:
+            if step % c["log_every"] == 0 and accelerator.is_local_main_process:
                 test_loss = run_inference(model, test_loader)
                 accelerator.print(
-                    f"Step {step} | Train Loss: {loss.item():.4f} | Test Loss: {test_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}"
+                    f"Step {step} | Train Loss: {loss.item():.4f} | Test Loss: {test_loss:.4f}"
                 )
 
                 if test_loss < best_test_loss:
                     best_test_loss = test_loss
-                    # Unwrap model before saving
                     unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_checkpoint(f"models/{model_id}/best")
-                    accelerator.print(
-                        f"✓ New best model saved! Loss: {best_test_loss:.4f}"
-                    )
+                    save_path = os.path.join(paths["models_dir"], model_id, "best")
+                    unwrapped_model.save_checkpoint(save_path)
+                    accelerator.print(f"✓ New best model saved! Loss: {best_test_loss:.4f}")
 
-            if step % save_every == 0 and accelerator.is_local_main_process:
+            if step % c["save_every"] == 0 and accelerator.is_local_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.save_checkpoint(f"models/{model_id}/latest")
+                save_path = os.path.join(paths["models_dir"], model_id, "latest")
+                unwrapped_model.save_checkpoint(save_path)
 
     # Save final model
     if accelerator.is_local_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_checkpoint(f"models/{model_id}/final")
+        save_path = os.path.join(paths["models_dir"], model_id, "final")
+        unwrapped_model.save_checkpoint(save_path)
         accelerator.print("Training complete.")
